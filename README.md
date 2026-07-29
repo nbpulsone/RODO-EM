@@ -46,6 +46,8 @@ Some examples:
 
 `./run_em_opt.sh parity ppvp WA/price results` (PPVP optimization on Walmart-Amazon)
 
+The variables at the top of [run_em_opt.sh](run_em_opt.sh) script can be modified to change the hyperparameters (e.g. robust weight, ema smoothing, regularization, learning rate, batch size, etc.)
+
 ## Grid Search
 To find the best set of hyperparmaters for a given optimizer-metric configuration, set the grids in [opt_grid.sh](opt_grid.sh) and run:
 
