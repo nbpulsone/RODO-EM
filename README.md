@@ -18,7 +18,7 @@ See the [data](data) folder for details, and [configs.json](configs.json) for th
 ## Quick Start
 To train and evaluate a model for Robust Domain-Aware EM type:
 
-`./run_em_opt.sh <optimizer> <metric> <dataset>`
+`./run_em_opt.sh <optimizer> <metric> <dataset> <output_directory_file_path>`
 
 The available optimizers to run are: 
 1. k (where k is an integer)
@@ -38,15 +38,20 @@ The available metrics to optimize for are:
 
 Some examples: 
 
-`./run_em_opt.sh 1 worst WDC/category_50un_50cc` (worst-1 optimization on WDC Multi-Dimensional Dataset)
+`./run_em_opt.sh 1 worst WDC/category_50un_50cc results` (worst-1 optimization on WDC Multi-Dimensional Dataset)
 
-`./run_em_opt.sh dro worst WDC/products_medium` (DRO optimization on WDC Products Corpus)
+`./run_em_opt.sh dro worst WDC/products_medium results` (DRO optimization on WDC Products Corpus)
 
-`./run_em_opt.sh parity variance AB/abtbuy_brand` (Variance optimization optimization on Abt_Buy)
+`./run_em_opt.sh parity variance AB/abtbuy_brand results` (Variance optimization optimization on Abt_Buy)
 
-`./run_em_opt.sh parity ppvp WA/price` (PPVP optimization on Walmart-Amazon)
+`./run_em_opt.sh parity ppvp WA/price results` (PPVP optimization on Walmart-Amazon)
 
 ## Grid Search
 To find the best set of hyperparmaters for a given optimizer-metric configuration, set the grids in [opt_grid.sh](opt_grid.sh) and run:
 
 `./opt_grid.sh`
+
+## Case Study
+To run the case study from the paper, type:
+
+`./run_case_study.sh`
