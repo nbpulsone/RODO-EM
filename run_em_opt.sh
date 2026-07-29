@@ -16,12 +16,17 @@
 # module load python/3.7.13/jz4yxoc
 # source ../../ditto/myenv/bin/activate
 
-# task/dataset configuration
-TASK="WDC/category_50un_50cc"
+# seed for current run
 SEED=0
 
-# optimization parameters/settings
-OPT="robust-1-worst"
+# parse cmd line arguments
+OPTIMIZER="$1"
+METRIC="$2"
+TASK="$3"
+OUTDIR="$4"
+
+# optimization settings
+OPT="robust-${OPTIMIZER}-${METRIC}"
 LM="distilbert"
 BS=64
 LR=5e-5
@@ -31,11 +36,10 @@ RW=4.0
 EMA=0.0
 WD=0.01
 SM="resample_loss" # options: "resample_loss", "resample_f1", "balanced", "none"
+echo "Optimizer is ${OPT}, running on dataset ${TASK}, with out directory ${OUTDIR}"
 
-# out files configuration
-OUTDIR="./WDCMD_worst1_grid_results"
-OUTFILE="./WDCMD_worst1_grid_results/WDCMD_worst1_grid_results.txt"
-
+# out result file path
+OUTFILE="${OUTDIR}/rodoem_results.txt"
 
 EXTRA_ARGS=()
 if [ "$SM" = "balanced" ]; then
