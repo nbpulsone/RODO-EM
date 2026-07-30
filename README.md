@@ -5,7 +5,7 @@ Entity Matching (EM) is a core task in data management that determines whether r
 
 This work builds on the [DITTO](https://github.com/megagonlabs/ditto/tree/master) pipeline for fine-tuning a PLM for EM.
  
-<img width="1536" height="1024" alt="rodoem_diagram" src="https://github.com/user-attachments/assets/eee8ce6a-1fa7-4694-b67a-e25192cc129a" />
+<img width="1536" height="1024" alt="rodoem_diagram" src="https://github.com/user-attachments/assets/51ed10ab-05e3-48b2-ab7a-27abf7ec4e05" />
   
 ## Requirements
 1. Python 3.7.13
@@ -46,7 +46,7 @@ Some examples:
 
 `./run_em_opt.sh parity ppvp WA/price results` (PPVP optimization on Walmart-Amazon)
 
-The variables at the top of [run_em_opt.sh](run_em_opt.sh) script can be modified to change the hyperparameters (e.g. robust weight, ema smoothing, regularization, learning rate, batch size, etc.)
+RoDo-EM is modular: the variables at the top of [run_em_opt.sh](run_em_opt.sh) script can be modified to include/exclude/configure individual robustness components (e.g. robust weight, sampling strategy, regularization, ema smoothing, etc.) 
 
 ## Grid Search
 To find the best set of hyperparmaters for a given optimizer-metric configuration, set the grids in [opt_grid.sh](opt_grid.sh) and run:
