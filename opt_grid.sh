@@ -8,7 +8,7 @@
 #SBATCH --partition=short
 #SBATCH -C "A100|A100-80G|A30|V100|P100|L40S"
 #SBATCH -x gpu-6-[01-20]
-#SBATCH --array=0-9%10
+#SBATCH --array=0-35%10
 #SBATCH -o ./logs/WDCMD_worst1_grid_%A_%a.out
 #SBATCH -e ./logs/WDCMD_worst1_grid_%A_%a.err
 
@@ -50,6 +50,7 @@ LRS=(5e-5)
 ROBUST_WEIGHTS=(2.0 4.0)
 EMA_ALPHAS=(0.0 0.4 0.8)
 SAMPLERS=("none" "balanced" "resample_loss")
+WEIGHT_DECAYS=(0.00 0.01)
 
 N_BS=${#BATCH_SIZES[@]}
 N_LR=${#LRS[@]}
