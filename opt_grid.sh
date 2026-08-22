@@ -1,31 +1,41 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH -n 4
-#SBATCH --mem=16g
-#SBATCH -J "WA_worst1_grid"
+#SBATCH --mem=64g
+#SBATCH -J "WDCMD_llama_worst1_grid"
 #SBATCH -t 24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=short
-#SBATCH -C "A100|A100-80G|A30|V100|P100|L40S"
+#SBATCH -C "A100-80G"
 #SBATCH -x gpu-6-[01-20]
-#SBATCH --array=0-35%10
-#SBATCH -o ./logs/WDCMD_worst1_grid_%A_%a.out
-#SBATCH -e ./logs/WDCMD_worst1_grid_%A_%a.err
+#SBATCH --array=0-7%8
+#SBATCH -o ./logs/WDCMD_worst1_llama_grid_%A_%a.out
+#SBATCH -e ./logs/WDCMD_worst1_llama_grid_%A_%a.err
 
 set -euo pipefail
 mkdir -p ./logs
-#module load python/3.7.13/jz4yxoc
-#source ../../ditto/myenv/bin/activate
+
+# -------------------------
+# Backbone mode
+# -------------------------
+USES_LORA=true
+if [ "$USES_LORA" = true ]; then
+    module load python/3.11.12/7vjddo3
+    source /home/nbpulsone/sandbox_research/rodoem_llm_ft/modenv/bin/activate
+else
+    module load python/3.7.13/jz4yxoc
+    source ../../ditto/myenv/bin/activate
+fi
 
 # use one shared local Hugging Face cache for every array task.
 export HF_HOME="$HOME/hf_cache"
-export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+export HF_HUB_CACHE="$HF_HOME/hub"
 
-# prevent grid jobs from contacting huggingface.co.
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
-if [ ! -d "$TRANSFORMERS_CACHE" ]; then
-    echo "ERROR: Hugging Face cache not found at $TRANSFORMERS_CACHE"
+
+if [ ! -d "$HF_HUB_CACHE" ]; then
+    echo "ERROR: Hugging Face cache not found at $HF_HUB_CACHE"
     exit 1
 fi
 
@@ -33,24 +43,24 @@ fi
 # experiment settings
 # -------------------------
 TASK="WDC/category_50un_50cc"
-N_EPOCHS=10
+N_EPOCHS=6
 MAX_LEN=128
 SEED=0
-LM="distilbert"
+LM="meta-llama/Llama-3.1-8B"
 OPT="robust-1-worst"
-OUTDIR="./WDCMD_worst1_grid_results"
+OUTDIR="./WDCMD_worst1_llama_grid_results"
 
 # -------------------------
 # Light hyperparameter grid
 # Total jobs = 1 * 1 * 2 * 3 * 3 = 36
 # This grid was used for to construct the main results for each optimizer (Section 6.1)
 # -------------------------
-BATCH_SIZES=(64)
-LRS=(5e-5)
+BATCH_SIZES=(8)
+LRS=(1e-4)
 ROBUST_WEIGHTS=(2.0 4.0)
-EMA_ALPHAS=(0.0 0.4 0.8)
-SAMPLERS=("none" "balanced" "resample_loss")
-WEIGHT_DECAYS=(0.00 0.01)
+EMA_ALPHAS=(0.0 0.4)
+SAMPLERS=("none" "resample_loss")
+WEIGHT_DECAYS=(0.00)
 
 N_BS=${#BATCH_SIZES[@]}
 N_LR=${#LRS[@]}
@@ -117,6 +127,21 @@ elif [ "$SM" = "resample_size" ]; then
     EXTRA_ARGS+=(--domain_resample --resample_by size)
 fi
 
+MODEL_ARGS=()
+if [ "$USES_LORA" = true ]; then
+    MODEL_ARGS+=(
+        --lora
+        --lora_r 8
+        --lora_alpha 16
+        --lora_dropout 0.05
+        --bf16
+    )
+else
+    MODEL_ARGS+=(
+        --fp16
+    )
+fi
+
 echo "Running grid job ${SLURM_ARRAY_TASK_ID}/${TOTAL}"
 echo "TASK=$TASK OPT=$OPT BS=$BS LR=$LR RW=$RW EMA=$EMA SM=$SM WD=$WD SEED=$SEED"
 echo "Allocated node: ${SLURMD_NODENAME:-unknown}"
@@ -132,7 +157,6 @@ CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
     --finetuning \
     --summarize \
     --lm "$LM" \
-    --fp16 \
     --save_model \
     --use_gpu \
     --outfile "$OUTFILE" \
@@ -141,4 +165,5 @@ CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
     --ema_alpha "$EMA" \
     --weight_decay "$WD" \
     --eval_plots_path "$PLOTDIR" \
+    "${MODEL_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"

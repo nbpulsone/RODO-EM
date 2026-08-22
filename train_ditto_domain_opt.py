@@ -122,6 +122,11 @@ if __name__=="__main__":
     parser.add_argument("--logdir", type=str, default="checkpoints/")
     parser.add_argument("--lm", type=str, default='distilbert')
     parser.add_argument("--fp16", dest="fp16", action="store_true")
+    parser.add_argument("--lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--da", type=str, default=None)
     parser.add_argument("--alpha_aug", type=float, default=0.8)
     parser.add_argument("--dk", type=str, default=None)
@@ -155,6 +160,10 @@ if __name__=="__main__":
     # only a single task for baseline
     task = hp.task
     opt = hp.opt
+
+    # ensure floating point preceision consistency
+    if hp.fp16 and hp.bf16:
+        raise ValueError("Use either --fp16 or --bf16, not both.")
 
     # create the tag of the run
     run_tag = '%s_lm=%s_da=%s_dk=%s_su=%s_size=%s_id=%d' % (task, hp.lm, hp.da,
@@ -209,14 +218,16 @@ if __name__=="__main__":
                                    da=hp.da,
                                    hp=hp,
                                    dom_ids=domain_train_ids)
-    valid_dataset = DittoDataset(validset, lm=hp.lm)
-    test_dataset = DittoDataset(testset, lm=hp.lm)
+    valid_dataset = DittoDataset(validset, lm=hp.lm, max_len=hp.max_len)
+    test_dataset = DittoDataset(testset, lm=hp.lm, max_len=hp.max_len)
 
     # domain (validation) datasets
     domain_evals = [DittoDataset(dom, lm=hp.lm) for dom in val_domain_sets]
 
     # create checkpoint path for this model/run
-    hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", f"run_{hp.run_id}")
+    lm_safe = hp.lm.replace("/", "_")
+    hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", lm_safe, f"run_{hp.run_id}")
+    #hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", f"run_{hp.run_id}")
     hp.base_ckpt_path = os.path.join(hp.ckpt_dir, "base_model.pt")
     weight_decay = getattr(hp, "weight_decay", 0.0)
 
@@ -226,6 +237,7 @@ if __name__=="__main__":
     hp.ckpt_path = hp.base_ckpt_path
     base_run_tag = run_tag + "_base"
     reset_seed(hp.run_id)
+
     base_results = train(
                         train_dataset,
                         valid_dataset,

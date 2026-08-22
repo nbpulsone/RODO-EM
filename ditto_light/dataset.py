@@ -5,13 +5,20 @@ from .augment import Augmenter
 
 # map lm name to huggingface's pre-trained model names
 lm_mp = {'roberta': 'roberta-base',
-         'distilbert': 'distilbert-base-uncased'}
+         'distilbert': 'distilbert-base-uncased',
+         'bert': 'bert-base-uncased'}
 
 def get_tokenizer(lm):
     if lm in lm_mp:
-        return AutoTokenizer.from_pretrained(lm_mp[lm])
+        tokenizer = AutoTokenizer.from_pretrained(lm_mp[lm])
     else:
-        return AutoTokenizer.from_pretrained(lm)
+        tokenizer = AutoTokenizer.from_pretrained(lm)
+
+    # llama does not define a padding token by default.
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return tokenizer
 
 
 class DittoDataset(data.Dataset):
@@ -139,15 +146,17 @@ class DittoDataset(data.Dataset):
             else:
                 return x, self.labels[idx]
 
-    @staticmethod
-    def pad(batch):
+    def pad(self, batch):
+        # identify pad token
+        pad_id = self.tokenizer.pad_token_id
+
         # Standard input with domain and CC labels:
         # (x, y, domain_id, cc_label)
         if len(batch[0]) == 4 and isinstance(batch[0][1], int):
             x12, y, d, cc = zip(*batch)
 
             maxlen = max(len(x) for x in x12)
-            x12 = [xi + [0] * (maxlen - len(xi)) for xi in x12]
+            x12 = [xi + [pad_id] * (maxlen - len(xi)) for xi in x12]
 
             return (
                 torch.LongTensor(x12),
@@ -162,8 +171,8 @@ class DittoDataset(data.Dataset):
             x1, x2, y, d, cc = zip(*batch)
 
             maxlen = max(len(x) for x in x1 + x2)
-            x1 = [xi + [0] * (maxlen - len(xi)) for xi in x1]
-            x2 = [xi + [0] * (maxlen - len(xi)) for xi in x2]
+            x1 = [xi + [pad_id] * (maxlen - len(xi)) for xi in x1]
+            x2 = [xi + [pad_id] * (maxlen - len(xi)) for xi in x2]
 
             return (
                 torch.LongTensor(x1),
@@ -175,20 +184,20 @@ class DittoDataset(data.Dataset):
         elif len(batch[0]) == 3 and isinstance(batch[0][1], int):
             x12, y, d = zip(*batch)
             maxlen = max(len(x) for x in x12)
-            x12 = [xi + [0]*(maxlen - len(xi)) for xi in x12]
+            x12 = [xi + [pad_id]*(maxlen - len(xi)) for xi in x12]
             return torch.LongTensor(x12), torch.LongTensor(y), torch.LongTensor(d)
         elif len(batch[0]) == 3:
             x1, x2, y = zip(*batch)
 
             maxlen = max([len(x) for x in x1+x2])
-            x1 = [xi + [0]*(maxlen - len(xi)) for xi in x1]
-            x2 = [xi + [0]*(maxlen - len(xi)) for xi in x2]
+            x1 = [xi + [pad_id]*(maxlen - len(xi)) for xi in x1]
+            x2 = [xi + [pad_id]*(maxlen - len(xi)) for xi in x2]
             return torch.LongTensor(x1), \
                    torch.LongTensor(x2), \
                    torch.LongTensor(y)
         else:
             x12, y = zip(*batch)
             maxlen = max([len(x) for x in x12])
-            x12 = [xi + [0]*(maxlen - len(xi)) for xi in x12]
+            x12 = [xi + [pad_id]*(maxlen - len(xi)) for xi in x12]
             return torch.LongTensor(x12), \
                    torch.LongTensor(y)

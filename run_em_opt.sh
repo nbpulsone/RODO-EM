@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH -n 4
-#SBATCH --mem=16g
+#SBATCH --mem=64g
 #SBATCH -J "DITTO_test"
 #SBATCH -t 24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=short
-#SBATCH -C "A100|A100-80G|A30|V100|P100|L40S"
+#SBATCH -C "A100-80G"
 #SBATCH -x gpu-6-[01-20]
 
 #SBATCH -o ./logs/robust_opt_%j.out
@@ -15,6 +15,10 @@
 # interactive command: srun -N 1 -n 2 --mem=32768 --time=120 --partition=short --gres=gpu:1 -x "gpu-6-[01-20]" --pty /usr/bin/bash
 # module load python/3.7.13/jz4yxoc
 # source ../../ditto/myenv/bin/activate
+module load python/3.11.12/7vjddo3
+source /home/nbpulsone/sandbox_research/rodoem_llm_ft/modenv/bin/activate
+
+# example run: ./run_em_opt.sh 1 worst WDC/category_50un_50cc verification_logs
 
 # seed for current run
 SEED=0
@@ -26,11 +30,12 @@ TASK="$3"
 OUTDIR="$4"
 
 # optimization settings
+USES_LORA=true
 OPT="robust-${OPTIMIZER}-${METRIC}"
-LM="distilbert"
-BS=64
-LR=5e-5
-N_EPOCHS=10
+LM="meta-llama/Llama-3.1-8B"
+BS=8
+LR=1e-4
+N_EPOCHS=6
 MAX_LEN=128
 RW=4.0
 EMA=0.0
@@ -39,7 +44,7 @@ SM="resample_loss" # options: "resample_loss", "resample_f1", "balanced", "none"
 echo "Optimizer is ${OPT}, running on dataset ${TASK}, with out directory ${OUTDIR}"
 
 # out result file path
-OUTFILE="${OUTDIR}/rodoem_results.txt"
+OUTFILE="${OUTDIR}/rodoem_llama_complete_results.txt"
 
 EXTRA_ARGS=()
 if [ "$SM" = "balanced" ]; then
@@ -50,6 +55,21 @@ elif [ "$SM" = "resample_f1" ]; then
     EXTRA_ARGS+=(--domain_resample --resample_by f1)
 elif [ "$SM" = "resample_size" ]; then
     EXTRA_ARGS+=(--domain_resample --resample_by size)
+fi
+
+MODEL_ARGS=()
+if [ "$USES_LORA" = true ]; then
+    MODEL_ARGS+=(
+        --lora
+        --lora_r 8
+        --lora_alpha 16
+        --lora_dropout 0.05
+        --bf16
+    )
+else
+    MODEL_ARGS+=(
+        --fp16
+    )
 fi
 
 # Run the domain-optimization script
@@ -63,7 +83,6 @@ CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
     --finetuning \
     --lm "$LM" \
     --summarize \
-    --fp16 \
     --save_model \
     --use_gpu \
     --outfile "$OUTFILE" \
@@ -72,4 +91,5 @@ CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
     --ema_alpha "$EMA" \
     --weight_decay "$WD" \
     --eval_plots_path "$OUTDIR" \
+    "${MODEL_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"
