@@ -8,7 +8,7 @@ This work builds on the [DITTO](https://github.com/megagonlabs/ditto/tree/master
 <img width="1536" height="1024" alt="rodoem_diagram" src="https://github.com/user-attachments/assets/51ed10ab-05e3-48b2-ab7a-27abf7ec4e05" />
   
 ## Requirements
-1. Python 3.7.13
+1. Python 3.11.12
 2. For full list of dependencies, see [requirements.txt](requirements.txt)
 
 ## Datasets
