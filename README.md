@@ -33,8 +33,6 @@ The available metrics to optimize for are:
 4. variance
 5. ppvp (Predictive Positive Value Parity)
 6. tprp (True Postivie Rate Parity)
-7. smallest
-8. biggest
 
 Some examples: 
 
