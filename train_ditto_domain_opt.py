@@ -122,6 +122,11 @@ if __name__=="__main__":
     parser.add_argument("--logdir", type=str, default="checkpoints/")
     parser.add_argument("--lm", type=str, default='distilbert')
     parser.add_argument("--fp16", dest="fp16", action="store_true")
+    parser.add_argument("--lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--da", type=str, default=None)
     parser.add_argument("--alpha_aug", type=float, default=0.8)
     parser.add_argument("--dk", type=str, default=None)
@@ -134,13 +139,19 @@ if __name__=="__main__":
     # --> e.g.: robust-dro-worst, robust-1-worst, robust-parity-ppvp, etc.
 
     # robustness optimization parameters
-    parser.add_argument("--robust_weight", type=float, default=5.0) # how much to weight the poor performing domain's samples
+    parser.add_argument("--robust_weight", type=float, default=None, help="Fixed robustness weight. If omitted, adapt from previous epoch domain losses.") # how much to weight the poor performing domain's samples
+    parser.add_argument("--adaptive_window", type=int, default=1) # number of previous loss observations averaged for adaptive weighting
+    parser.add_argument("--adaptive_granularity", type=str, default="epoch", choices=["epoch", "iteration"]) # "recompute adaptive weight by epoch or training iteration
+    parser.add_argument("--adaptive_update_freq", type=int, default=1) # recompute adaptive weight every N epochs/iterations
     parser.add_argument("--ema_alpha", type=float, default=0.0) # whether to smooth across epochs and by how much
     parser.add_argument("--eval_plots_path", type=str, default="eval_plots") # path to loss/f1 plots
     parser.add_argument("--domain_resample", dest="domain_resample", action="store_true") # whether to overly represent poor performing domain's samples in the next epoch
     parser.add_argument("--resample_by", type=str, default="loss", choices=["loss", "f1", "size"])
     parser.add_argument("--balanced_batches", action="store_true") # whether to represent domains evenly in batches
     parser.add_argument("--weight_decay", type=float, default=0.0) # how much l2 weight decay to provide during training
+
+    parser.add_argument("--disable_robust_loss", action="store_true")
+    parser.add_argument("--measure_runtimes", action="store_true")
 
     hp = parser.parse_args()
 
@@ -155,6 +166,10 @@ if __name__=="__main__":
     # only a single task for baseline
     task = hp.task
     opt = hp.opt
+
+    # ensure floating point preceision consistency
+    if hp.fp16 and hp.bf16:
+        raise ValueError("Use either --fp16 or --bf16, not both.")
 
     # create the tag of the run
     run_tag = '%s_lm=%s_da=%s_dk=%s_su=%s_size=%s_id=%d' % (task, hp.lm, hp.da,
@@ -180,8 +195,11 @@ if __name__=="__main__":
         trainset = summarizer.transform_file(trainset, max_len=hp.max_len)
         validset = summarizer.transform_file(validset, max_len=hp.max_len)
         testset = summarizer.transform_file(testset, max_len=hp.max_len)
+        for i in range(len(train_domain_sets)):
+            train_domain_sets[i] = summarizer.transform_file(train_domain_sets[i], max_len=hp.max_len)
         for i in range(len(val_domain_sets)):
             val_domain_sets[i] = summarizer.transform_file(val_domain_sets[i], max_len=hp.max_len)
+        
 
     # domain knowlege injection
     if hp.dk is not None:
@@ -209,14 +227,17 @@ if __name__=="__main__":
                                    da=hp.da,
                                    hp=hp,
                                    dom_ids=domain_train_ids)
-    valid_dataset = DittoDataset(validset, lm=hp.lm)
-    test_dataset = DittoDataset(testset, lm=hp.lm)
+    valid_dataset = DittoDataset(validset, lm=hp.lm, max_len=hp.max_len)
+    test_dataset = DittoDataset(testset, lm=hp.lm, max_len=hp.max_len)
 
-    # domain (validation) datasets
+    # domain-specific datasets
+    domain_train_evals = [DittoDataset(dom, lm=hp.lm, max_len=hp.max_len) for dom in train_domain_sets]
     domain_evals = [DittoDataset(dom, lm=hp.lm) for dom in val_domain_sets]
 
     # create checkpoint path for this model/run
-    hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", f"run_{hp.run_id}")
+    lm_safe = hp.lm.replace("/", "_")
+    hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", lm_safe, f"run_{hp.run_id}")
+    #hp.ckpt_dir = os.path.join(hp.logdir, hp.task.replace("/", "_"), hp.opt or "base", f"run_{hp.run_id}")
     hp.base_ckpt_path = os.path.join(hp.ckpt_dir, "base_model.pt")
     weight_decay = getattr(hp, "weight_decay", 0.0)
 
@@ -226,6 +247,11 @@ if __name__=="__main__":
     hp.ckpt_path = hp.base_ckpt_path
     base_run_tag = run_tag + "_base"
     reset_seed(hp.run_id)
+
+    # disable sampling for the base model
+    original_balanced = hp.balanced_batches
+    hp.balanced_batches = False
+
     base_results = train(
                         train_dataset,
                         valid_dataset,
@@ -239,6 +265,9 @@ if __name__=="__main__":
                         decay=0
                     )
 
+    # Restore for the component experiment
+    hp.balanced_batches = original_balanced
+
     # train and evaluate the general model optimized for lowest-performing domain
     hp.opt = opt
     robust_run_tag = run_tag + "_robust"
@@ -251,7 +280,8 @@ if __name__=="__main__":
                         robust_run_tag,
                         hp,
                         domain_evals=domain_evals,
-                        opt=hp.opt,
+                        domain_train_evals=domain_train_evals, # used for adaptive weighting
+                        opt=None if hp.disable_robust_loss else hp.opt,
                         report_opt=hp.opt,
                         eval_plots_path=hp.eval_plots_path,
                         decay=weight_decay
@@ -304,3 +334,12 @@ if __name__=="__main__":
             f.write(f"\n~~~ DOMAIN SUMMARY (ROBUST) ~~~\n")
             write_domain_f1_report(f, robust_selected, domain_names)
             write_summary(f, base_results, opt_results)
+
+            # include runtime summary if specified
+            if hp.measure_runtimes:
+                f.write("\n~~~ RUNTIME SUMMARY ~~~\n")
+                for name, results in [("Base", base_results), ("Robust", opt_results)]:
+                    rt = results[0]["runtime_summary"]
+                    f.write(f"{name} Training Time (s): {rt['training_seconds']:.2f}\n")
+                    f.write(f"{name} Inference Time (s): {rt['inference_seconds']:.4f}\n")
+                    f.write(f"{name} Inference Time (ms/pair): {rt['inference_ms_per_pair']:.4f}\n")

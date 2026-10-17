@@ -7,30 +7,80 @@ import sklearn.metrics as metrics
 from .robust_eval_utils import *
 from .rodoem_utils import *
 from torch.utils import data
-from transformers import AutoModel, AdamW, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers import AutoModel, get_linear_schedule_with_warmup
 from tensorboardX import SummaryWriter
-from apex import amp
 
-lm_mp = {'roberta': 'roberta-base',
-         'distilbert': 'distilbert-base-uncased'}
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+import time
+
+lm_mp = {
+    'roberta': 'roberta-base',
+    'distilbert': 'distilbert-base-uncased',
+    'bert': 'bert-base-uncased'
+}
 
 class DittoModel(nn.Module):
     """A baseline model for EM."""
 
-    def __init__(self, device='cuda', lm='roberta', alpha_aug=0.8):
+    def __init__(self, device='cuda', lm='roberta', alpha_aug=0.8, pad_token_id=None, use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.05):
         super().__init__()
-        if lm in lm_mp:
-            self.bert = AutoModel.from_pretrained(lm_mp[lm])
-        else:
-            self.bert = AutoModel.from_pretrained(lm)
+        model_name = lm_mp.get(lm, lm)
 
+        # llama should be loaded in BF16 on the A100.
+        is_llama_name = "llama" in model_name.lower()
+        if is_llama_name:
+            self.bert = AutoModel.from_pretrained(model_name, dtype=torch.bfloat16)
+        else:
+            self.bert = AutoModel.from_pretrained(model_name)
+
+        self.is_llama = self.bert.config.model_type == "llama"
         self.device = device
         self.alpha_aug = alpha_aug
+        self.pad_token_id = pad_token_id
+        hidden_size = self.bert.config.hidden_size
+        if self.is_llama and self.pad_token_id is None:
+            raise ValueError("Llama requires pad_token_id to construct the attention mask.")
+
+        # use LoRA for LLM finetuning (prevents training whole 8b parameter model)
+        self.use_lora = use_lora
+        if self.is_llama and self.use_lora:
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=["q_proj", "v_proj"],
+                bias="none",
+            )
+
+            self.bert = get_peft_model(
+                self.bert,
+                lora_config
+            )
 
         # linear layer
-        hidden_size = self.bert.config.hidden_size
         self.fc = torch.nn.Linear(hidden_size, 2)
 
+
+    def _encode(self, x):
+        # encode single batch into sequence-level representation
+        if self.is_llama:
+            # 1 for real tokens, 0 for padding.
+            attention_mask = (x != self.pad_token_id).long()
+            outputs = self.bert(input_ids=x, attention_mask=attention_mask)
+            hidden = outputs.last_hidden_state
+
+            # right padding used by DittoDataset
+            last_idx = attention_mask.sum(dim=1) - 1
+            batch_idx = torch.arange(hidden.size(0), device=hidden.device)
+            enc = hidden[batch_idx, last_idx]
+
+            #small classifier head for FP32
+            return enc.float()
+        else:
+            # existing BERT-based behavior.
+            outputs = self.bert(x)
+            return outputs.last_hidden_state[:, 0, :]
 
     def forward(self, x1, x2=None, embed=False):
         """Encode the left, right, and the concatenation of left+right.
@@ -46,7 +96,7 @@ class DittoModel(nn.Module):
         if x2 is not None:
             # MixDA
             x2 = x2.to(self.device) # (batch_size, seq_len)
-            enc = self.bert(torch.cat((x1, x2)))[0][:, 0, :]
+            enc = self._encode(torch.cat((x1, x2)))
             batch_size = len(x1)
             enc1 = enc[:batch_size] # (batch_size, emb_size)
             enc2 = enc[batch_size:] # (batch_size, emb_size)
@@ -54,12 +104,30 @@ class DittoModel(nn.Module):
             aug_lam = np.random.beta(self.alpha_aug, self.alpha_aug)
             enc = enc1 * aug_lam + enc2 * (1.0 - aug_lam)
         else:
-            enc = self.bert(x1)[0][:, 0, :]
+            enc = self._encode(x1)
 
         if embed:
             return enc
         else:
             return self.fc(enc) # .squeeze() # .sigmoid()
+
+    def print_trainable_parameters(self):
+        """ output which parameters are included in model fine-tuning """
+        trainable = 0
+        total = 0
+
+        for _, param in self.named_parameters():
+            total += param.numel()
+            if param.requires_grad:
+                trainable += param.numel()
+
+        print(f"Trainable parameters: {trainable:,}")
+        print(f"Total parameters:     {total:,}")
+        print(f"Trainable percentage: {100 * trainable / total:.4f}%")
+
+        if self.is_llama and self.use_lora:
+            print("\nPEFT backbone:")
+            self.bert.print_trainable_parameters()
 
 
 def evaluate(model, iterator, threshold=None):
@@ -103,12 +171,7 @@ def evaluate(model, iterator, threshold=None):
 
         return f1, best_th
 
-def evaluate_cc_checkpoint(
-    checkpoint_path,
-    cc_dataset,
-    non_cc_dataset,
-    hp,
-):
+def evaluate_cc_checkpoint(checkpoint_path, cc_dataset, non_cc_dataset, hp):
     """Load a selected checkpoint and compute CC FPR and non-CC F1."""
     device = "cuda" if hp.use_gpu and torch.cuda.is_available() else "cpu"
 
@@ -117,10 +180,16 @@ def evaluate_cc_checkpoint(
     model = DittoModel(
         device=device,
         lm=hp.lm,
-        alpha_aug=hp.alpha_aug
-    ).to(device)
+        alpha_aug=hp.alpha_aug,
+        pad_token_id=cc_dataset.tokenizer.pad_token_id,
+        use_lora=getattr(hp, "lora", False),
+        lora_r=getattr(hp, "lora_r", 8),
+        lora_alpha=getattr(hp, "lora_alpha", 16),
+        lora_dropout=getattr(hp, "lora_dropout", 0.05),
+    )
+    model = model.to(device)
 
-    model.load_state_dict(checkpoint["model"], strict=True)
+    load_model_checkpoint_state(model, checkpoint)
 
     cc_iter = data.DataLoader(
         dataset=cc_dataset,
@@ -162,201 +231,315 @@ def evaluate_cc_checkpoint(
         "non_cc_examples": non_cc_metrics["examples"],
     }
 
+def get_model_checkpoint_state(model):
+    """Return only the model weights that actually need saving."""
 
-def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt=None):
+    if model.is_llama and model.use_lora:
+        return {
+            "checkpoint_type": "peft",
+            "adapter": get_peft_model_state_dict(model.bert),
+            "fc": model.fc.state_dict(),
+        }
+
+    # Existing behavior for BERT-family models.
+    return {
+        "checkpoint_type": "full",
+        "model": model.state_dict(),
+    }
+
+def load_model_checkpoint_state(model, checkpoint):
+    """Load either a standard full checkpoint or a PEFT checkpoint."""
+
+    checkpoint_type = checkpoint.get("checkpoint_type", "full")
+
+    if checkpoint_type == "peft":
+        if not (model.is_llama and model.use_lora):
+            raise ValueError(
+                "PEFT checkpoint requires a Llama model initialized with LoRA."
+            )
+
+        load_result = set_peft_model_state_dict(
+            model.bert,
+            checkpoint["adapter"],
+        )
+
+        model.fc.load_state_dict(
+            checkpoint["fc"],
+            strict=True,
+        )
+
+        # Helpful sanity check.
+        if getattr(load_result, "unexpected_keys", None):
+            print(
+                "Warning: unexpected PEFT checkpoint keys:",
+                load_result.unexpected_keys
+            )
+
+    else:
+        model.load_state_dict(
+            checkpoint["model"],
+            strict=True,
+        )
+
+def train_step(train_iter, model, optimizer, scheduler, hp, train_dom_losses=None, opt=None, scaler=None):
     """Perform a single training step."""
     criterion = nn.CrossEntropyLoss()
     criterion_none = nn.CrossEntropyLoss(reduction='none')
+    use_fp16 = getattr(hp, "fp16", False)
+    use_bf16 = getattr(hp, "bf16", False)
+    amp_dtype = (
+        torch.bfloat16
+        if use_bf16
+        else torch.float16
+    )
 
+    # track iteration history foor adaptive weighting
+    iteration_history = []
+    current_adaptive_losses = (np.asarray(train_dom_losses, dtype=np.float64) if train_dom_losses is not None else None)
+
+    # loop over training mini-batches
     for i, batch in enumerate(train_iter):
         optimizer.zero_grad()
 
         domain_ids = None
         cc_ids = None
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(use_fp16 or use_bf16)):
+            # parse the training batch for samples, domain ids, augmentation, etc.
+            if len(batch) == 2:
+                # x, label
+                x, y = batch
+                prediction = model(x)
+            elif len(batch) == 3 and batch[1].dim() == 1:
+                # x, label, domain_id
+                x, y, domain_ids = batch
+                prediction = model(x)
+            elif len(batch) == 3:
+                # x, x_aug, label
+                x1, x2, y = batch
+                prediction = model(x1, x2)
+            elif len(batch) == 4 and batch[1].dim() == 1:
+                # x, label, domain_id, cc_label
+                x, y, domain_ids, cc_ids = batch
+                prediction = model(x)
+            elif len(batch) == 4:
+                # x, x_aug, label, domain_id
+                x1, x2, y, domain_ids = batch
+                prediction = model(x1, x2)
+            else:
+                # x, x_aug, label, domain_id, cc_label
+                x1, x2, y, domain_ids, cc_ids = batch
+                prediction = model(x1, x2)
 
-        # parse the training batch for samples, domain ids, augmentation, etc.
-        if len(batch) == 2:
-            # x, label
-            x, y = batch
-            prediction = model(x)
-        elif len(batch) == 3 and batch[1].dim() == 1:
-            # x, label, domain_id
-            x, y, domain_ids = batch
-            prediction = model(x)
-        elif len(batch) == 3:
-            # x, x_aug, label
-            x1, x2, y = batch
-            prediction = model(x1, x2)
-        elif len(batch) == 4 and batch[1].dim() == 1:
-            # x, label, domain_id, cc_label
-            x, y, domain_ids, cc_ids = batch
-            prediction = model(x)
-        elif len(batch) == 4:
-            # x, x_aug, label, domain_id
-            x1, x2, y, domain_ids = batch
-            prediction = model(x1, x2)
-        else:
-            # x, x_aug, label, domain_id, cc_label
-            x1, x2, y, domain_ids, cc_ids = batch
-            prediction = model(x1, x2)
+            # parse the optimizer and implement robustness objective if specified
+            if opt is not None and opt.startswith('robust') and domain_ids is not None:
+                y = y.to(model.device)
+                domain_ids = domain_ids.to(model.device)
+                if cc_ids is not None:
+                    cc_ids = cc_ids.to(model.device)
 
-        # parse the optimizer and implement robustness objective if specified
-        if opt is not None and opt.startswith('robust') and domain_ids is not None:
-            y = y.to(model.device)
-            domain_ids = domain_ids.to(model.device)
-            if cc_ids is not None:
-                cc_ids = cc_ids.to(model.device)
+                domain_objective = opt.split("-")[-1]
+                robust_weight = getattr(hp, "robust_weight", None)
 
-            domain_objective = opt.split("-")[-1]
-            robust_weight = getattr(hp, "robust_weight", 5.0)
+                # adapt robustness strength from previous epoch's domain losses
+                if robust_weight is None:
+                    if train_dom_losses is None:
+                        raise ValueError(
+                            "Adaptive robust weight requires previous domain training losses."
+                        )
 
-            per_sample_loss = criterion_none(prediction, y)
+                per_sample_loss = criterion_none(prediction, y)
 
-            # track per-group losses, counts, etc. to inform robust optimizers
-            group_losses = []
-            group_counts = []
-            group_cc_rates = []
-            group_ids = []
+                # track per-group losses, counts, etc. to inform robust optimizers
+                group_losses = []
+                group_counts = []
+                group_cc_rates = []
+                group_ids = []
 
-            for d in torch.unique(domain_ids):
-                mask = domain_ids == d
+                for d in torch.unique(domain_ids):
+                    mask = domain_ids == d
 
-                group_ids.append(d)
-                group_losses.append(per_sample_loss[mask].mean())
-                group_counts.append(mask.sum().float())
+                    group_ids.append(d)
+                    group_losses.append(per_sample_loss[mask].mean())
+                    group_counts.append(mask.sum().float())
+
+                    if cc_ids is not None:
+                        group_cc_rates.append(cc_ids[mask].float().mean())
+
+                group_losses = torch.stack(group_losses)
+                group_counts = torch.stack(group_counts)
+
+                # optionally update adaptive losses from minibatch observations
+                if (robust_weight is None and getattr(hp, "adaptive_granularity", "epoch") == "iteration"):
+                    update_freq = max(1, getattr(hp, "adaptive_update_freq", 1))
+                    adaptive_window = max(1, getattr(hp, "adaptive_window", 1))
+
+                    batch_dom_losses = np.full(len(train_dom_losses), np.nan)
+
+                    for d, gl in zip(group_ids, group_losses):
+                        batch_dom_losses[int(d.item())] = float(gl.detach().cpu())
+
+                    iteration_history.append(batch_dom_losses)
+                    iteration_history = iteration_history[-adaptive_window:]
+
+                    if (i + 1) % update_freq == 0:
+                        hist = np.stack(iteration_history)
+                        current_adaptive_losses = np.nanmean(hist, axis=0)
+
+                        missing = np.isnan(current_adaptive_losses)
+                        current_adaptive_losses[missing] = np.asarray(train_dom_losses)[missing]
+
+                # compute adaptive score based on user-provided granularity (whether by epoch or iteration)
+                if robust_weight is None:
+                    if getattr(hp, "adaptive_granularity", "epoch") == "iteration":
+                        losses = current_adaptive_losses
+                    else:
+                        losses = np.asarray(train_dom_losses, dtype=np.float64)
+                    mean_loss = losses.mean()
+                    std_loss = losses.std()
+                    eps = 1e-8
+
+                    # adaptive score is squared z-score of worst domain's loss
+                    adaptive_score = ((losses.max() - mean_loss) / (std_loss + eps)) ** 2
+                    if (i == 0 or (getattr(hp, "adaptive_granularity", "epoch") == "iteration" and (i + 1) % max(1, getattr(hp, "adaptive_update_freq", 1)) == 0)):
+                        print(
+                            f"~~~ Adaptive robustness ~~~:\n"
+                            f"mean_loss={mean_loss:.4f}, "
+                            f"std_loss={std_loss:.4f}, "
+                            f"max_loss={losses.max():.4f}, "
+                            f"score={adaptive_score:.4f}"
+                        )
 
                 if cc_ids is not None:
-                    group_cc_rates.append(cc_ids[mask].float().mean())
+                    group_cc_rates = torch.stack(group_cc_rates)
 
-            group_losses = torch.stack(group_losses)
-            group_counts = torch.stack(group_counts)
-
-            if cc_ids is not None:
-                group_cc_rates = torch.stack(group_cc_rates)
-
-            if opt.startswith("robust-static") and cc_ids is not None:
-                # static robust optimization based on provided information
-                # e.g. whicn samples are corner-cases
-                weights = 1.0 + robust_weight * group_cc_rates
-                weights = weights / weights.sum()
-                loss = torch.sum(weights * group_losses)
-            elif opt.startswith("robust-dro"):
-                # group distributionally robust optimizerion
-                dro_eta = robust_weight
-
-                if domain_objective == "best":
-                    # soft-min over domain losses
-                    loss = -torch.logsumexp(-dro_eta * group_losses, dim=0) / dro_eta
-
-                elif domain_objective == "worst":
-                    # soft-max over domain losses
-                    loss = torch.logsumexp(dro_eta * group_losses, dim=0) / dro_eta
-
-                elif domain_objective == "median":
-                    weights = median_proximity_weights_torch(group_losses, dro_eta)
-                    loss = torch.sum(weights * group_losses)
-
-                elif domain_objective == "median_size":
-                    weights = median_proximity_weights_torch(group_counts, dro_eta)
-                    loss = torch.sum(weights * group_losses)
-
-                elif domain_objective == "biggest":
-                    # size-adjusted soft-max: large domains get larger DRO prior weight
-                    weights = group_counts / group_counts.sum()
-                    log_weights = torch.log(weights.clamp(min=1e-12))
-                    loss = torch.logsumexp(log_weights + dro_eta * group_losses, dim=0) / dro_eta
-
-                else:  # smallest
-                    # inverse-size-adjusted soft-max: small domains get larger DRO prior weight
-                    weights = 1.0 / group_counts.clamp(min=1.0)
+                if opt.startswith("robust-static") and cc_ids is not None:
+                    # static robust optimization based on provided information
+                    # e.g. whicn samples are corner-cases
+                    weights = 1.0 + robust_weight * group_cc_rates
                     weights = weights / weights.sum()
-                    log_weights = torch.log(weights.clamp(min=1e-12))
-                    loss = torch.logsumexp(log_weights + dro_eta * group_losses, dim=0) / dro_eta
-            # parity based robustness objectives
-            elif opt.startswith("robust-parity-"):
-                parity_metric = opt.split("-")[-1]
-                # delegate parity loss calculation to helper fxn for clarity
-                loss = parity_training_loss(
-                    prediction=prediction,
-                    y=y,
-                    domain_ids=domain_ids,
-                    group_losses=group_losses,
-                    parity_metric=parity_metric,
-                    parity_weight=robust_weight,
-                )
+                    loss = torch.sum(weights * group_losses)
+                elif opt.startswith("robust-dro"):
+                    # group distributionally robust optimizerion                
+                    dro_eta = max(1.0, adaptive_score) if robust_weight is None else robust_weight
 
-            elif opt.startswith("robust-uniform"):
-                # equal domain weighting
-                loss = group_losses.mean()
+                    if domain_objective == "best":
+                        # soft-min over domain losses
+                        loss = -torch.logsumexp(-dro_eta * group_losses, dim=0) / dro_eta
 
-            elif opt.startswith("robust-size"):
-                # sample size-based robustness objectives
-                if domain_objective == "biggest":
-                    weights = group_counts
-                elif domain_objective == "median_size" or domain_objective == "median":
-                    weights = median_proximity_weights_torch(group_counts, robust_weight)
+                    elif domain_objective == "worst":
+                        # soft-max over domain losses
+                        loss = torch.logsumexp(dro_eta * group_losses, dim=0) / dro_eta
+
+                    elif domain_objective == "median":
+                        weights = median_proximity_weights_torch(group_losses, dro_eta)
+                        loss = torch.sum(weights * group_losses)
+
+                    elif domain_objective == "median_size":
+                        weights = median_proximity_weights_torch(group_counts, dro_eta)
+                        loss = torch.sum(weights * group_losses)
+
+                    elif domain_objective == "biggest":
+                        # size-adjusted soft-max: large domains get larger DRO prior weight
+                        weights = group_counts / group_counts.sum()
+                        log_weights = torch.log(weights.clamp(min=1e-12))
+                        loss = torch.logsumexp(log_weights + dro_eta * group_losses, dim=0) / dro_eta
+
+                    else:  # smallest
+                        # inverse-size-adjusted soft-max: small domains get larger DRO prior weight
+                        weights = 1.0 / group_counts.clamp(min=1.0)
+                        weights = weights / weights.sum()
+                        log_weights = torch.log(weights.clamp(min=1e-12))
+                        loss = torch.logsumexp(log_weights + dro_eta * group_losses, dim=0) / dro_eta
+                # parity based robustness objectives
+                elif opt.startswith("robust-parity-"):
+                    parity_metric = opt.split("-")[-1]
+                    parity_weight = (adaptive_score if robust_weight is None else robust_weight)
+
+                    # delegate parity loss calculation to helper fxn for clarity
+                    loss = parity_training_loss(
+                        prediction=prediction,
+                        y=y,
+                        domain_ids=domain_ids,
+                        group_losses=group_losses,
+                        parity_metric=parity_metric,
+                        parity_weight=parity_weight,
+                    )
+
+                elif opt.startswith("robust-uniform"):
+                    # equal domain weighting
+                    loss = group_losses.mean()
+
+                elif opt.startswith("robust-size"):
+                    # sample size-based robustness objectives
+                    if domain_objective == "biggest":
+                        weights = group_counts
+                    elif domain_objective == "median_size" or domain_objective == "median":
+                        weights = median_proximity_weights_torch(group_counts, robust_weight)
+                    else:
+                        weights = 1.0 / group_counts.clamp(min=1.0)
+
+                    weights = weights / weights.sum()
+                    loss = torch.sum(weights * group_losses)
+
+                elif opt.startswith("robust-"):
+                    # robust-k-objective, e.g. robust-1-worst, robust-2-best
+                    parts = opt.split("-")
+                    try:
+                        k = int(parts[1])
+                    except (IndexError, ValueError):
+                        raise ValueError(
+                            f"Unknown robust option: {opt}. "
+                            "Expected robust-k-objective, e.g. robust-1-worst."
+                        )
+
+                    k = min(k, group_losses.numel())
+
+                    if domain_objective == "best":
+                        selected_idx = torch.topk(group_losses, k, largest=False).indices
+
+                    elif domain_objective == "worst":
+                        selected_idx = torch.topk(group_losses, k, largest=True).indices
+
+                    elif domain_objective == "biggest":
+                        selected_idx = torch.topk(group_counts, k, largest=True).indices
+
+                    elif domain_objective == "median":
+                        selected_idx = torch.tensor(
+                            median_k_idx(group_losses.detach().cpu().numpy(), k),
+                            device=group_losses.device
+                        )
+
+                    elif domain_objective == "median_size":
+                        selected_idx = torch.tensor(
+                            median_k_idx(group_counts.detach().cpu().numpy(), k),
+                            device=group_losses.device
+                        )
+
+                    else:  # smallest
+                        selected_idx = torch.topk(group_counts, k, largest=False).indices
+
+                    weights = torch.ones_like(group_losses)
+                    weight = (1.0 + adaptive_score if robust_weight is None else robust_weight)
+                    weights[selected_idx] = weight
+                    weights = weights / weights.sum()
+
+                    loss = torch.sum(weights * group_losses)
+
                 else:
-                    weights = 1.0 / group_counts.clamp(min=1.0)
-
-                weights = weights / weights.sum()
-                loss = torch.sum(weights * group_losses)
-
-            elif opt.startswith("robust-"):
-                # robust-k-objective, e.g. robust-1-worst, robust-2-best
-                parts = opt.split("-")
-                try:
-                    k = int(parts[1])
-                except (IndexError, ValueError):
-                    raise ValueError(
-                        f"Unknown robust option: {opt}. "
-                        "Expected robust-k-objective, e.g. robust-1-worst."
-                    )
-
-                k = min(k, group_losses.numel())
-
-                if domain_objective == "best":
-                    selected_idx = torch.topk(group_losses, k, largest=False).indices
-
-                elif domain_objective == "worst":
-                    selected_idx = torch.topk(group_losses, k, largest=True).indices
-
-                elif domain_objective == "biggest":
-                    selected_idx = torch.topk(group_counts, k, largest=True).indices
-
-                elif domain_objective == "median":
-                    selected_idx = torch.tensor(
-                        median_k_idx(group_losses.detach().cpu().numpy(), k),
-                        device=group_losses.device
-                    )
-
-                elif domain_objective == "median_size":
-                    selected_idx = torch.tensor(
-                        median_k_idx(group_counts.detach().cpu().numpy(), k),
-                        device=group_losses.device
-                    )
-
-                else:  # smallest
-                    selected_idx = torch.topk(group_counts, k, largest=False).indices
-
-                weights = torch.ones_like(group_losses)
-                weights[selected_idx] = robust_weight
-                weights = weights / weights.sum()
-
-                loss = torch.sum(weights * group_losses)
-
+                    loss = criterion(prediction, y)
+            # no robustness objective specified: use default optimizer
             else:
-                loss = criterion(prediction, y)
-        # no robustness objective specified: use default optimizer
-        else:
-            loss = criterion(prediction, y.to(model.device))
+                loss = criterion(prediction, y.to(model.device))
 
-        if hp.fp16:
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+        if use_fp16:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
+            # BF16 and FP32
             loss.backward()
+            optimizer.step()
 
-        optimizer.step()
         scheduler.step()
 
         if i % 10 == 0:
@@ -365,7 +548,7 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
         del loss
 
 
-def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
+def train(trainset, validset, testset, run_tag, hp, domain_evals=None, domain_train_evals=None,
           opt=None, eval_plots_path=None, decay=0.0, report_opt=None, init_checkpoint=None):
     """Train and evaluate the model
 
@@ -418,6 +601,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
     dom_iters = [data.DataLoader(dataset=de, batch_size=hp.batch_size*16,
                   shuffle=False, num_workers=0, collate_fn=padder)
                   for de in domain_evals] if domain_evals else None
+    train_dom_iters = [data.DataLoader(dataset=de, batch_size=hp.batch_size*16,
+                        shuffle=False, num_workers=0, collate_fn=de.pad) 
+                        for de in domain_train_evals ] if domain_train_evals else None
 
     # whether to overrepresent poor performing domains in next epoch or not
     use_domain_resample = getattr(hp, 'domain_resample', False) and opt is not None
@@ -436,9 +622,16 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
 
     # initialize model, optimizer, and LR scheduler
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = DittoModel(device=device,
-                       lm=hp.lm,
-                       alpha_aug=hp.alpha_aug)
+    model = DittoModel(
+        device=device,
+        lm=hp.lm,
+        alpha_aug=hp.alpha_aug,
+        pad_token_id=trainset.tokenizer.pad_token_id,
+        use_lora=getattr(hp, "lora", False),
+        lora_r=getattr(hp, "lora_r", 8),
+        lora_alpha=getattr(hp, "lora_alpha", 16),
+        lora_dropout=getattr(hp, "lora_dropout", 0.05),
+    )
     model = model.to(device)
 
     # continue training from previous checkpoint
@@ -447,11 +640,8 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             raise FileNotFoundError(
                 f"Initial checkpoint not found: {init_checkpoint}"
             )
-
         checkpoint = torch.load(init_checkpoint, map_location=device)
-        state_dict = checkpoint.get("model", checkpoint)
-        model.load_state_dict(state_dict, strict=True)
-
+        load_model_checkpoint_state(model, checkpoint)
         print(f"Initialized model weights from: {init_checkpoint}")
 
     # optimizer (with the option of l2 regularization)
@@ -460,22 +650,29 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
         {
             "params": [
                 p for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay)
+                if p.requires_grad 
+                and not any(nd in n for nd in no_decay)
             ],
             "weight_decay": decay,
         },
         {
             "params": [
                 p for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay)
+                if p.requires_grad 
+                and any(nd in n for nd in no_decay)
             ],
             "weight_decay": 0.0,
         },
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=hp.lr)
 
-    if hp.fp16:
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O2')
+    # configure optimization settings
+    optimizer = AdamW(optimizer_grouped_parameters, lr=hp.lr)
+    use_fp16 = getattr(hp, "fp16", False)
+    use_bf16 = getattr(hp, "bf16", False)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_fp16
+    )
     num_steps = (len(trainset) // hp.batch_size) * hp.n_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=0,
@@ -483,11 +680,18 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
 
     # logging with tensorboardX
     writer = SummaryWriter(log_dir=hp.logdir)
+    if getattr(hp, "lora", False):
+        model.print_trainable_parameters()
 
     # initialize metrics 
     model.eval()
-    best_dev_f1 = best_test_f1 = 0.0
+    
+    # init performance trackers
+    best_dev_f1 = float("-inf")
+    best_test_f1 = 0.0
     best_epoch = None
+
+    # validation-domain losses (used only for reporting robustness progress)
     dom_losses = None
     if dom_iters:
         raw_dom_losses = [evaluate_loss(model, dom_it) for dom_it in dom_iters]
@@ -501,13 +705,35 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
         tracked_parity_scores = []
         tracked_parity_disparities = []
 
+    # training-domain loss tracking
+    train_dom_losses = None
+    train_dom_loss_history = []
+
+    adaptive_window = max(1, getattr(hp, "adaptive_window", 1))
+
+    if train_dom_iters:
+        raw_train_dom_losses = [evaluate_loss(model, dom_it) for dom_it in train_dom_iters]
+        train_dom_losses = update_ema_losses(None, raw_train_dom_losses, hp.ema_alpha)
+
+        # adaptive weighting uses raw training losses, independent of EMA
+        train_dom_loss_history.append(np.asarray(raw_train_dom_losses, dtype=np.float64))
+        print(f"Adaptive robustness window: {adaptive_window}")
+
+    # init adaptive dom losses
+    adaptive_dom_losses = np.mean(np.stack(train_dom_loss_history[-adaptive_window:]), axis=0 ) if train_dom_loss_history else None
+
+    # measure run times (if specified) 
+    measure_runtimes = getattr(hp, "measure_runtimes", False)
+    training_seconds = 0.0
+    selected_inference_seconds = None
+
     # main train loop
     for epoch in range(1, hp.n_epochs+1):
         # rebuild train_iter with updated domain weights if resampling is on
         # incliude parser.add_argument("--balanced_batches", action="store_true")
         # ---> use --balanced_batches mutually exclusive w.r.t. --domain_resample --resample_by f1
         use_balanced_batches = getattr(hp, "balanced_batches", False) and trainset.domain_labels is not None
-        if use_balanced_batches and opt is not None:
+        if use_balanced_batches:
             train_iter = make_train_iter(balanced_batches=True)
         elif use_domain_resample and dom_losses is not None and opt is not None:
             sampler = make_domain_weighted_sampler(
@@ -521,14 +747,53 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
 
         # train
         model.train()
-        train_step(train_iter, model, optimizer, scheduler, hp, dom_losses, opt)
+
+        # average each domain's loss over the most recent w observations
+        if (opt is not None and getattr(hp, "adaptive_granularity", "epoch") == "epoch" and train_dom_loss_history):
+            update_freq = max(1, getattr(hp, "adaptive_update_freq", 1))
+            if epoch == 1 or (epoch - 1) % update_freq == 0:
+                adaptive_dom_losses = np.mean(np.stack(train_dom_loss_history[-adaptive_window:]), axis=0)
+
+        # perform the training epoch
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+
+        train_step(train_iter, model, optimizer, scheduler, hp, adaptive_dom_losses, opt, scaler)
+
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            training_seconds += time.perf_counter() - start
+
+        model.eval()
+        # evaluate training-domain losses after this epoch (will determine the adaptive weight next epoch)
+        if train_dom_iters:
+            raw_train_dom_losses = [evaluate_loss(model, dom_it) for dom_it in train_dom_iters]
+
+            # EMA remains available for other pipeline functionality
+            train_dom_losses = update_ema_losses(train_dom_losses, raw_train_dom_losses, hp.ema_alpha)
+
+            # adaptive weighting uses raw losses only
+            train_dom_loss_history.append(np.asarray(raw_train_dom_losses, dtype=np.float64))
+            train_dom_loss_history = train_dom_loss_history[-adaptive_window:]
 
         # eval (f1)
-        model.eval()
         dev_f1, th = evaluate(model, valid_iter)
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+
         test_f1 = evaluate(model, test_iter, threshold=th)
+
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            epoch_inference_seconds = time.perf_counter() - start
         if dom_iters:
-            # eval (domain loss)
+            # eval (valid domain loss)
             raw_dom_losses = [evaluate_loss(model, dom_it) for dom_it in dom_iters]
             dom_losses = update_ema_losses(dom_losses, raw_dom_losses, hp.ema_alpha)
             dom_f1s = [evaluate(model, dom_it, threshold=th) for dom_it in dom_iters]
@@ -554,6 +819,7 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     domain_sizes,
                     plot_k
                 )
+            # parity-based robust evaluation
             if report_opt is not None and report_opt.startswith("robust-parity-"):
                 parity_score = parity_stats["parity_scores"][domain_objective]
                 parity_disparity = parity_stats["parity_disparities"][domain_objective]
@@ -589,9 +855,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             total_parity_stats.append(parity_stats)
 
         # determine selection score based on criteria
-        if (not dom_iters) or (opt is None) or opt.startswith("robust-static"):
+        if (not dom_iters) or (report_opt is None) or report_opt.startswith("robust-static"):
             selection_score = dev_f1
-        elif opt.startswith("robust-parity-"):
+        elif report_opt.startswith("robust-parity-"):
             selection_score = parity_stats["parity_scores"][domain_objective]
         elif domain_objective in ["best", "worst", "median"]: # performance-based
             f1s = np.array(dom_f1s, dtype=np.float64)
@@ -621,28 +887,39 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             best_dev_f1 = selection_score
             best_test_f1 = test_f1
             best_epoch = epoch
+            if measure_runtimes:
+                selected_inference_seconds = epoch_inference_seconds
             if hp.save_model:
                 # create the directory if not exist
-                #directory = os.path.join(hp.logdir, hp.task)
                 directory = hp.ckpt_dir
                 if not os.path.exists(directory):
                     os.makedirs(directory)
 
                 # save the checkpoints for each component
                 ckpt_path = hp.ckpt_path
-                ckpt = {'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'epoch': epoch,
-                        # Global validation threshold used to evaluate this selected checkpoint.
-                        'threshold': float(th),
-                        'selection_score': float(selection_score),
-                        'task': hp.task,
-                        'lm': hp.lm,
-                        'max_len': hp.max_len,
-                        'summarize': bool(getattr(hp, "summarize", False)),
-                        'opt': opt
-                        }
+                model_state = get_model_checkpoint_state(model)
+                ckpt = {
+                    **model_state,
+
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch': epoch,
+
+                    'threshold': float(th),
+                    'selection_score': float(selection_score),
+
+                    'task': hp.task,
+                    'lm': hp.lm,
+                    'max_len': hp.max_len,
+                    'summarize': bool(getattr(hp, "summarize", False)),
+                    'opt': opt,
+
+                    # Save LoRA configuration explicitly for reproducibility.
+                    'use_lora': bool(getattr(hp, "lora", False)),
+                    'lora_r': getattr(hp, "lora_r", 8),
+                    'lora_alpha': getattr(hp, "lora_alpha", 16),
+                    'lora_dropout': getattr(hp, "lora_dropout", 0.05),
+                }
                 torch.save(ckpt, ckpt_path)
 
         # report per-epoch robust optimization progress
@@ -685,9 +962,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
         for ep in range(1, len(total_dom_losses)):
             ep_loss = np.array(total_dom_losses[ep], dtype=np.float64)
             ep_f1s = np.array(total_dom_f1s[ep], dtype=np.float64)
-
             k_ep = min(k, len(ep_loss))
 
+            # identify which domains are currently being priortized by the model
             if (domain_objective in ["macro_f1", "weighted_f1"] or 
                 (report_opt is not None and report_opt.startswith("robust-parity-"))):
                 tracked_idxs = np.arange(len(ep_loss))
@@ -698,10 +975,11 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     domain_sizes,
                     k_ep
                 )
-
             tracked_doms.append(tracked_idxs.tolist())
 
+            
             if report_opt is not None and report_opt.startswith("robust-parity-"):
+                # parity based objectives
                 epoch_parity = total_parity_stats[ep - 1]
 
                 tracked_dom_losses.append(
@@ -711,10 +989,12 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     epoch_parity["parity_scores"][domain_objective]
                 )
             elif domain_objective == "weighted_f1":
+                # weighted average across domains
                 weights = domain_sizes / domain_sizes.sum()
                 tracked_dom_losses.append(float(np.sum(ep_loss * weights)))
                 tracked_dom_f1s.append(float(np.sum(ep_f1s * weights)))
             else:
+                # default to macro average across domains
                 tracked_dom_losses.append(float(np.mean(ep_loss[tracked_idxs])))
                 tracked_dom_f1s.append(float(np.mean(ep_f1s[tracked_idxs])))
 
@@ -796,6 +1076,16 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                 path=os.path.join(eval_plots_path, f"{safe_run_tag}_tracked_k_f1.png"),
                 best_epoch=best_epoch
             )
+
+    # if specified, mesure and report the training and inference run time statistics
+    if measure_runtimes and results:
+        results[0]["runtime_summary"] = {
+            "training_seconds": training_seconds,
+            "inference_seconds": selected_inference_seconds,
+            "inference_ms_per_pair": (
+                1000.0 * selected_inference_seconds / len(testset)
+            ),
+        }
 
     writer.close()
     return results if dom_iters else best_test_f1

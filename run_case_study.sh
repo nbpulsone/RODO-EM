@@ -14,10 +14,10 @@
 
 # interactive command: srun -N 1 -n 2 --mem=32768 --time=120 --partition=short --gres=gpu:1 -x "gpu-6-[01-20]" --pty /usr/bin/bash
 
-module load python/3.7.13/jz4yxoc
-source ../../ditto/myenv/bin/activate
+# module load python/3.11.12/7vjddo3
+# source /home/nbpulsone/sandbox_research/rodoem_llm_ft/modenv/bin/activate
 
-MATCHER_INPUT="input/wa_price_test.jsonl"
+MATCHER_INPUT="data/wa_price/wa_test.txt"
 LABELED_TEST="data/wa_price/wa_test.txt"
 
 # run the domain-optimization script
@@ -30,12 +30,10 @@ CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
     --finetuning \
     --lm distilbert \
     --summarize \
-    --fp16 \
     --save_model \
     --use_gpu \
     --outfile "./case_study/wa_price_results_DRO.txt" \
     --opt robust-dro-worst \
-    --robust_weight 4.0 \
     --balanced_batches \
     --ema_alpha 0.8 \
     --weight_decay 0.01 \
@@ -51,7 +49,6 @@ CUDA_VISIBLE_DEVICES=0 python matcher.py \
   --max_len 128 \
   --summarize \
   --use_gpu \
-  --fp16 \
   --checkpoint checkpoints/WA_price/robust-dro-worst/run_0/base_model.pt
 
 # generate predictions for the robust model 
@@ -63,7 +60,6 @@ CUDA_VISIBLE_DEVICES=0 python matcher.py \
   --max_len 128 \
   --summarize \
   --use_gpu \
-  --fp16 \
   --checkpoint checkpoints/WA_price/robust-dro-worst/run_0/robust_model.pt
 
 # calculate the dollar amount preserved due to matching for the base moodel and robust model
