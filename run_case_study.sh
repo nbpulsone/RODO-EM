@@ -19,6 +19,7 @@
 
 MATCHER_INPUT="data/wa_price/wa_test.txt"
 LABELED_TEST="data/wa_price/wa_test.txt"
+mkdir -p output case_study checkpoints
 
 # run the domain-optimization script
 CUDA_VISIBLE_DEVICES=0 python train_ditto_domain_opt.py \
@@ -49,7 +50,7 @@ CUDA_VISIBLE_DEVICES=0 python matcher.py \
   --max_len 128 \
   --summarize \
   --use_gpu \
-  --checkpoint checkpoints/WA_price/robust-dro-worst/run_0/base_model.pt
+  --checkpoint checkpoints/WA_price/robust-dro-worst/distilbert/run_0/base_model.pt
 
 # generate predictions for the robust model 
 CUDA_VISIBLE_DEVICES=0 python matcher.py \
@@ -60,7 +61,7 @@ CUDA_VISIBLE_DEVICES=0 python matcher.py \
   --max_len 128 \
   --summarize \
   --use_gpu \
-  --checkpoint checkpoints/WA_price/robust-dro-worst/run_0/robust_model.pt
+  --checkpoint checkpoints/WA_price/robust-dro-worst/distilbert/run_0/robust_model.pt
 
 # calculate the dollar amount preserved due to matching for the base moodel and robust model
 CUDA_VISIBLE_DEVICES=0 python case_study_price_calculator.py \

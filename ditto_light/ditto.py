@@ -893,7 +893,7 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None, domain_tr
                 # create the directory if not exist
                 directory = hp.ckpt_dir
                 if not os.path.exists(directory):
-                    os.makedirs(directory)
+                    os.makedirs(directory, exist_ok=True)
 
                 # save the checkpoints for each component
                 ckpt_path = hp.ckpt_path
