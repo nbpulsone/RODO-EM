@@ -94,22 +94,29 @@ def parse_filename(path):
     # patterns intentionally specific so task/opt values with hyphens or underscores do not confuse the parser.
     patterns = {
         "task": r"task=(.*?)_opt=",
-        "opt": r"_opt=(.*?)_bs=",
+        "opt": r"_opt=(.*?)(?:_bs=|_aw=|_ema=)",
         "batch_size": r"_bs=([^_]+)",
         "lr": r"_lr=([^_]+)",
         "robust_weight": r"_rw=([^_]+)",
+        "adaptive_window": r"_aw=([^_]+)",
+        "adaptive_granularity": r"_ag=([^_]+)",
+        "adaptive_frequency": r"_af=([^_]+)",
         "ema_alpha": r"_ema=([^_]+)",
         "sampler": r"_sampler=(.*?)_wd=",
         "weight_decay": r"_wd=([^_]+)",
         "seed": r"_seed=([^_]+)$",
     }
+    
 
     for key, pattern in patterns.items():
         match = re.search(pattern, stem)
         fields[key] = match.group(1) if match else None
 
     # cast numeric fields when possible.
-    int_fields = ["batch_size", "seed"]
+    int_fields = [
+        "batch_size", "seed",
+        "adaptive_window", "adaptive_frequency"
+    ]
     float_fields = ["lr", "robust_weight", "ema_alpha", "weight_decay"]
 
     for key in int_fields:
@@ -430,6 +437,9 @@ def main():
         "weight_decay",
         "seed",
         "file",
+        "adaptive_window",
+        "adaptive_granularity",
+        "adaptive_frequency",
     ]
     display_cols = [c for c in display_cols if c in valid.columns]
 
@@ -452,7 +462,11 @@ def main():
 
     print("\nBest setting:")
     best = valid.iloc[0]
-    for key in ["batch_size", "lr", "robust_weight", "ema_alpha", "sampler", "weight_decay", "seed"]:
+    for key in [
+            "opt", "batch_size", "lr", "robust_weight",
+            "adaptive_window", "adaptive_granularity", "adaptive_frequency",
+            "ema_alpha", "sampler", "weight_decay", "seed", "file"
+        ]:
         if key in best:
             print(f"  {key}: {best[key]}")
 

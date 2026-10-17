@@ -15,7 +15,6 @@ import traceback
 
 from torch.utils import data
 from tqdm import tqdm
-from apex import amp
 from scipy.special import softmax
 
 from ditto_light.ditto import evaluate, DittoModel
@@ -92,10 +91,10 @@ def classify(sentence_pairs, model,
                            lm=lm)
     # print(dataset[0])
     iterator = data.DataLoader(dataset=dataset,
-                               batch_size=len(dataset),
-                               shuffle=False,
-                               num_workers=0,
-                               collate_fn=DittoDataset.pad)
+                           batch_size=len(dataset),
+                           shuffle=False,
+                           num_workers=0,
+                           collate_fn=dataset.pad)
 
     # prediction
     all_probs = []
@@ -117,7 +116,7 @@ def classify(sentence_pairs, model,
 
 def predict(input_path, output_path, config,
             model,
-            batch_size=1024,
+            batch_size=8,
             summarizer=None,
             lm='distilbert',
             max_len=256,
@@ -161,7 +160,7 @@ def predict(input_path, output_path, config,
 
     # input_path can also be train/valid/test.txt
     # convert to jsonlines
-    if '.txt' in input_path:
+    if input_path.endswith('.txt'):
         with jsonlines.open(input_path + '.jsonl', mode='w') as writer:
             for line in open(input_path):
                 writer.write(line.split('\t')[:2])
@@ -213,14 +212,11 @@ def tune_threshold(config, model, hp):
     valid_dataset = DittoDataset(validset,
                                  max_len=hp.max_len,
                                  lm=hp.lm)
-
-    # print(valid_dataset[0])
-
     valid_iter = data.DataLoader(dataset=valid_dataset,
-                                 batch_size=64,
-                                 shuffle=False,
-                                 num_workers=0,
-                                 collate_fn=DittoDataset.pad)
+                             batch_size=64,
+                             shuffle=False,
+                             num_workers=0,
+                             collate_fn=valid_dataset.pad)
 
     # acc, prec, recall, f1, v_loss, th = eval_classifier(model, valid_iter,
     #                                                     get_threshold=True)
@@ -253,46 +249,52 @@ def tune_threshold(config, model, hp):
     return th
 
 
+def load_model(task, checkpoint, lm, use_gpu, fp16=True, max_len=256):
+    """Load a trained Ditto checkpoint."""
 
-def load_model(task, path, lm, use_gpu, fp16=True):
-    """Load a model for a specific task.
-
-    Args:
-        task (str): the task name
-        path (str): the path of the checkpoint directory
-        lm (str): the language model
-        use_gpu (boolean): whether to use gpu
-        fp16 (boolean, optional): whether to use fp16
-
-    Returns:
-        Dictionary: the task config
-        MultiTaskNet: the model
-    """
-    # load models
-    checkpoint = os.path.join(path, task, 'model.pt')
     if not os.path.exists(checkpoint):
         raise ModelNotFoundError(checkpoint)
 
     configs = json.load(open('configs.json'))
-    configs = {conf['name'] : conf for conf in configs}
+    configs = {conf['name']: conf for conf in configs}
     config = configs[task]
-    config_list = [config]
 
-    if use_gpu:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+
+    saved_state = torch.load(checkpoint, map_location=device)
+
+    # Get tokenizer information needed by Llama.
+    tmp_dataset = DittoDataset(
+        ["COL dummy VAL dummy\tCOL dummy VAL dummy\t0"],
+        max_len=max_len,
+        lm=lm
+    )
+
+    model = DittoModel(
+        device=device,
+        lm=lm,
+        pad_token_id=tmp_dataset.tokenizer.pad_token_id,
+        use_lora=saved_state.get("use_lora", False),
+        lora_r=saved_state.get("lora_r", 8),
+        lora_alpha=saved_state.get("lora_alpha", 16),
+        lora_dropout=saved_state.get("lora_dropout", 0.05),
+    )
+
+    
+    if "checkpoint_type" in saved_state:
+        # rodo-em checkpoint format
+        from ditto_light.ditto import load_model_checkpoint_state
+        load_model_checkpoint_state(model, saved_state)
     else:
-        device = 'cpu'
+        # old ditto checkpointing
+        model.load_state_dict(saved_state['model'])
 
-    model = DittoModel(device=device, lm=lm)
-
-    saved_state = torch.load(checkpoint, map_location=lambda storage, loc: storage)
-    model.load_state_dict(saved_state['model'])
+    # load model for evaluation and extract threshold
     model = model.to(device)
+    model.eval()
+    threshold = float(saved_state.get("threshold", 0.5))
 
-    if fp16 and 'cuda' in device:
-        model = amp.initialize(model, opt_level='O2')
-
-    return config, model
+    return config, model, threshold
 
 
 if __name__ == "__main__":
@@ -303,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--lm", type=str, default='distilbert')
     parser.add_argument("--use_gpu", dest="use_gpu", action="store_true")
     parser.add_argument("--fp16", dest="fp16", action="store_true")
-    parser.add_argument("--checkpoint_path", type=str, default='checkpoints/')
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--dk", type=str, default=None)
     parser.add_argument("--summarize", dest="summarize", action="store_true")
     parser.add_argument("--max_len", type=int, default=256)
@@ -311,8 +313,7 @@ if __name__ == "__main__":
 
     # load the models
     set_seed(123)
-    config, model = load_model(hp.task, hp.checkpoint_path,
-                       hp.lm, hp.use_gpu, hp.fp16)
+    config, model, threshold = load_model(hp.task, hp.checkpoint, hp.lm, hp.use_gpu, hp.fp16, max_len=hp.max_len)
 
     summarizer = dk_injector = None
     if hp.summarize:
@@ -324,8 +325,8 @@ if __name__ == "__main__":
         else:
             dk_injector = GeneralDKInjector(config, hp.dk)
 
-    # tune threshold
-    threshold = tune_threshold(config, model, hp)
+    # tune threshold --> skip for now, load from model state
+    # threshold = tune_threshold(config, model, hp)
 
     # run prediction
     predict(hp.input_path, hp.output_path, config, model,

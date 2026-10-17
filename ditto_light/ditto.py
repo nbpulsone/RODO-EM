@@ -12,6 +12,7 @@ from transformers import AutoModel, get_linear_schedule_with_warmup
 from tensorboardX import SummaryWriter
 
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+import time
 
 lm_mp = {
     'roberta': 'roberta-base',
@@ -26,7 +27,7 @@ class DittoModel(nn.Module):
         super().__init__()
         model_name = lm_mp.get(lm, lm)
 
-        # Llama should be loaded in BF16 on the A100.
+        # llama should be loaded in BF16 on the A100.
         is_llama_name = "llama" in model_name.lower()
         if is_llama_name:
             self.bert = AutoModel.from_pretrained(model_name, dtype=torch.bfloat16)
@@ -111,6 +112,7 @@ class DittoModel(nn.Module):
             return self.fc(enc) # .squeeze() # .sigmoid()
 
     def print_trainable_parameters(self):
+        """ output which parameters are included in model fine-tuning """
         trainable = 0
         total = 0
 
@@ -279,19 +281,23 @@ def load_model_checkpoint_state(model, checkpoint):
             strict=True,
         )
 
-def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt=None, scaler=None):
+def train_step(train_iter, model, optimizer, scheduler, hp, train_dom_losses=None, opt=None, scaler=None):
     """Perform a single training step."""
     criterion = nn.CrossEntropyLoss()
     criterion_none = nn.CrossEntropyLoss(reduction='none')
     use_fp16 = getattr(hp, "fp16", False)
     use_bf16 = getattr(hp, "bf16", False)
-
     amp_dtype = (
         torch.bfloat16
         if use_bf16
         else torch.float16
     )
 
+    # track iteration history foor adaptive weighting
+    iteration_history = []
+    current_adaptive_losses = (np.asarray(train_dom_losses, dtype=np.float64) if train_dom_losses is not None else None)
+
+    # loop over training mini-batches
     for i, batch in enumerate(train_iter):
         optimizer.zero_grad()
 
@@ -332,7 +338,14 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                     cc_ids = cc_ids.to(model.device)
 
                 domain_objective = opt.split("-")[-1]
-                robust_weight = getattr(hp, "robust_weight", 5.0)
+                robust_weight = getattr(hp, "robust_weight", None)
+
+                # adapt robustness strength from previous epoch's domain losses
+                if robust_weight is None:
+                    if train_dom_losses is None:
+                        raise ValueError(
+                            "Adaptive robust weight requires previous domain training losses."
+                        )
 
                 per_sample_loss = criterion_none(prediction, y)
 
@@ -355,6 +368,47 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                 group_losses = torch.stack(group_losses)
                 group_counts = torch.stack(group_counts)
 
+                # optionally update adaptive losses from minibatch observations
+                if (robust_weight is None and getattr(hp, "adaptive_granularity", "epoch") == "iteration"):
+                    update_freq = max(1, getattr(hp, "adaptive_update_freq", 1))
+                    adaptive_window = max(1, getattr(hp, "adaptive_window", 1))
+
+                    batch_dom_losses = np.full(len(train_dom_losses), np.nan)
+
+                    for d, gl in zip(group_ids, group_losses):
+                        batch_dom_losses[int(d.item())] = float(gl.detach().cpu())
+
+                    iteration_history.append(batch_dom_losses)
+                    iteration_history = iteration_history[-adaptive_window:]
+
+                    if (i + 1) % update_freq == 0:
+                        hist = np.stack(iteration_history)
+                        current_adaptive_losses = np.nanmean(hist, axis=0)
+
+                        missing = np.isnan(current_adaptive_losses)
+                        current_adaptive_losses[missing] = np.asarray(train_dom_losses)[missing]
+
+                # compute adaptive score based on user-provided granularity (whether by epoch or iteration)
+                if robust_weight is None:
+                    if getattr(hp, "adaptive_granularity", "epoch") == "iteration":
+                        losses = current_adaptive_losses
+                    else:
+                        losses = np.asarray(train_dom_losses, dtype=np.float64)
+                    mean_loss = losses.mean()
+                    std_loss = losses.std()
+                    eps = 1e-8
+
+                    # adaptive score is squared z-score of worst domain's loss
+                    adaptive_score = ((losses.max() - mean_loss) / (std_loss + eps)) ** 2
+                    if (i == 0 or (getattr(hp, "adaptive_granularity", "epoch") == "iteration" and (i + 1) % max(1, getattr(hp, "adaptive_update_freq", 1)) == 0)):
+                        print(
+                            f"~~~ Adaptive robustness ~~~:\n"
+                            f"mean_loss={mean_loss:.4f}, "
+                            f"std_loss={std_loss:.4f}, "
+                            f"max_loss={losses.max():.4f}, "
+                            f"score={adaptive_score:.4f}"
+                        )
+
                 if cc_ids is not None:
                     group_cc_rates = torch.stack(group_cc_rates)
 
@@ -365,8 +419,8 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                     weights = weights / weights.sum()
                     loss = torch.sum(weights * group_losses)
                 elif opt.startswith("robust-dro"):
-                    # group distributionally robust optimizerion
-                    dro_eta = robust_weight
+                    # group distributionally robust optimizerion                
+                    dro_eta = max(1.0, adaptive_score) if robust_weight is None else robust_weight
 
                     if domain_objective == "best":
                         # soft-min over domain losses
@@ -399,6 +453,8 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                 # parity based robustness objectives
                 elif opt.startswith("robust-parity-"):
                     parity_metric = opt.split("-")[-1]
+                    parity_weight = (adaptive_score if robust_weight is None else robust_weight)
+
                     # delegate parity loss calculation to helper fxn for clarity
                     loss = parity_training_loss(
                         prediction=prediction,
@@ -406,7 +462,7 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                         domain_ids=domain_ids,
                         group_losses=group_losses,
                         parity_metric=parity_metric,
-                        parity_weight=robust_weight,
+                        parity_weight=parity_weight,
                     )
 
                 elif opt.startswith("robust-uniform"):
@@ -463,7 +519,8 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
                         selected_idx = torch.topk(group_counts, k, largest=False).indices
 
                     weights = torch.ones_like(group_losses)
-                    weights[selected_idx] = robust_weight
+                    weight = (1.0 + adaptive_score if robust_weight is None else robust_weight)
+                    weights[selected_idx] = weight
                     weights = weights / weights.sum()
 
                     loss = torch.sum(weights * group_losses)
@@ -491,7 +548,7 @@ def train_step(train_iter, model, optimizer, scheduler, hp, dom_losses=None, opt
         del loss
 
 
-def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
+def train(trainset, validset, testset, run_tag, hp, domain_evals=None, domain_train_evals=None,
           opt=None, eval_plots_path=None, decay=0.0, report_opt=None, init_checkpoint=None):
     """Train and evaluate the model
 
@@ -544,6 +601,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
     dom_iters = [data.DataLoader(dataset=de, batch_size=hp.batch_size*16,
                   shuffle=False, num_workers=0, collate_fn=padder)
                   for de in domain_evals] if domain_evals else None
+    train_dom_iters = [data.DataLoader(dataset=de, batch_size=hp.batch_size*16,
+                        shuffle=False, num_workers=0, collate_fn=de.pad) 
+                        for de in domain_train_evals ] if domain_train_evals else None
 
     # whether to overrepresent poor performing domains in next epoch or not
     use_domain_resample = getattr(hp, 'domain_resample', False) and opt is not None
@@ -604,17 +664,15 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             "weight_decay": 0.0,
         },
     ]
+
+    # configure optimization settings
     optimizer = AdamW(optimizer_grouped_parameters, lr=hp.lr)
     use_fp16 = getattr(hp, "fp16", False)
     use_bf16 = getattr(hp, "bf16", False)
-
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=use_fp16
     )
-
-    #if hp.fp16:
-        #model, optimizer = amp.initialize(model, optimizer, opt_level='O2')
     num_steps = (len(trainset) // hp.batch_size) * hp.n_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=0,
@@ -633,6 +691,7 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
     best_test_f1 = 0.0
     best_epoch = None
 
+    # validation-domain losses (used only for reporting robustness progress)
     dom_losses = None
     if dom_iters:
         raw_dom_losses = [evaluate_loss(model, dom_it) for dom_it in dom_iters]
@@ -646,13 +705,35 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
         tracked_parity_scores = []
         tracked_parity_disparities = []
 
+    # training-domain loss tracking
+    train_dom_losses = None
+    train_dom_loss_history = []
+
+    adaptive_window = max(1, getattr(hp, "adaptive_window", 1))
+
+    if train_dom_iters:
+        raw_train_dom_losses = [evaluate_loss(model, dom_it) for dom_it in train_dom_iters]
+        train_dom_losses = update_ema_losses(None, raw_train_dom_losses, hp.ema_alpha)
+
+        # adaptive weighting uses raw training losses, independent of EMA
+        train_dom_loss_history.append(np.asarray(raw_train_dom_losses, dtype=np.float64))
+        print(f"Adaptive robustness window: {adaptive_window}")
+
+    # init adaptive dom losses
+    adaptive_dom_losses = np.mean(np.stack(train_dom_loss_history[-adaptive_window:]), axis=0 ) if train_dom_loss_history else None
+
+    # measure run times (if specified) 
+    measure_runtimes = getattr(hp, "measure_runtimes", False)
+    training_seconds = 0.0
+    selected_inference_seconds = None
+
     # main train loop
     for epoch in range(1, hp.n_epochs+1):
         # rebuild train_iter with updated domain weights if resampling is on
         # incliude parser.add_argument("--balanced_batches", action="store_true")
         # ---> use --balanced_batches mutually exclusive w.r.t. --domain_resample --resample_by f1
         use_balanced_batches = getattr(hp, "balanced_batches", False) and trainset.domain_labels is not None
-        if use_balanced_batches and opt is not None:
+        if use_balanced_batches:
             train_iter = make_train_iter(balanced_batches=True)
         elif use_domain_resample and dom_losses is not None and opt is not None:
             sampler = make_domain_weighted_sampler(
@@ -666,14 +747,53 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
 
         # train
         model.train()
-        train_step(train_iter, model, optimizer, scheduler, hp, dom_losses, opt, scaler)
+
+        # average each domain's loss over the most recent w observations
+        if (opt is not None and getattr(hp, "adaptive_granularity", "epoch") == "epoch" and train_dom_loss_history):
+            update_freq = max(1, getattr(hp, "adaptive_update_freq", 1))
+            if epoch == 1 or (epoch - 1) % update_freq == 0:
+                adaptive_dom_losses = np.mean(np.stack(train_dom_loss_history[-adaptive_window:]), axis=0)
+
+        # perform the training epoch
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+
+        train_step(train_iter, model, optimizer, scheduler, hp, adaptive_dom_losses, opt, scaler)
+
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            training_seconds += time.perf_counter() - start
+
+        model.eval()
+        # evaluate training-domain losses after this epoch (will determine the adaptive weight next epoch)
+        if train_dom_iters:
+            raw_train_dom_losses = [evaluate_loss(model, dom_it) for dom_it in train_dom_iters]
+
+            # EMA remains available for other pipeline functionality
+            train_dom_losses = update_ema_losses(train_dom_losses, raw_train_dom_losses, hp.ema_alpha)
+
+            # adaptive weighting uses raw losses only
+            train_dom_loss_history.append(np.asarray(raw_train_dom_losses, dtype=np.float64))
+            train_dom_loss_history = train_dom_loss_history[-adaptive_window:]
 
         # eval (f1)
-        model.eval()
         dev_f1, th = evaluate(model, valid_iter)
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+
         test_f1 = evaluate(model, test_iter, threshold=th)
+
+        if measure_runtimes:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            epoch_inference_seconds = time.perf_counter() - start
         if dom_iters:
-            # eval (domain loss)
+            # eval (valid domain loss)
             raw_dom_losses = [evaluate_loss(model, dom_it) for dom_it in dom_iters]
             dom_losses = update_ema_losses(dom_losses, raw_dom_losses, hp.ema_alpha)
             dom_f1s = [evaluate(model, dom_it, threshold=th) for dom_it in dom_iters]
@@ -699,6 +819,7 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     domain_sizes,
                     plot_k
                 )
+            # parity-based robust evaluation
             if report_opt is not None and report_opt.startswith("robust-parity-"):
                 parity_score = parity_stats["parity_scores"][domain_objective]
                 parity_disparity = parity_stats["parity_disparities"][domain_objective]
@@ -734,9 +855,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             total_parity_stats.append(parity_stats)
 
         # determine selection score based on criteria
-        if (not dom_iters) or (opt is None) or opt.startswith("robust-static"):
+        if (not dom_iters) or (report_opt is None) or report_opt.startswith("robust-static"):
             selection_score = dev_f1
-        elif opt.startswith("robust-parity-"):
+        elif report_opt.startswith("robust-parity-"):
             selection_score = parity_stats["parity_scores"][domain_objective]
         elif domain_objective in ["best", "worst", "median"]: # performance-based
             f1s = np.array(dom_f1s, dtype=np.float64)
@@ -766,9 +887,10 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
             best_dev_f1 = selection_score
             best_test_f1 = test_f1
             best_epoch = epoch
+            if measure_runtimes:
+                selected_inference_seconds = epoch_inference_seconds
             if hp.save_model:
                 # create the directory if not exist
-                #directory = os.path.join(hp.logdir, hp.task)
                 directory = hp.ckpt_dir
                 if not os.path.exists(directory):
                     os.makedirs(directory)
@@ -840,9 +962,9 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
         for ep in range(1, len(total_dom_losses)):
             ep_loss = np.array(total_dom_losses[ep], dtype=np.float64)
             ep_f1s = np.array(total_dom_f1s[ep], dtype=np.float64)
-
             k_ep = min(k, len(ep_loss))
 
+            # identify which domains are currently being priortized by the model
             if (domain_objective in ["macro_f1", "weighted_f1"] or 
                 (report_opt is not None and report_opt.startswith("robust-parity-"))):
                 tracked_idxs = np.arange(len(ep_loss))
@@ -853,10 +975,11 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     domain_sizes,
                     k_ep
                 )
-
             tracked_doms.append(tracked_idxs.tolist())
 
+            
             if report_opt is not None and report_opt.startswith("robust-parity-"):
+                # parity based objectives
                 epoch_parity = total_parity_stats[ep - 1]
 
                 tracked_dom_losses.append(
@@ -866,10 +989,12 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                     epoch_parity["parity_scores"][domain_objective]
                 )
             elif domain_objective == "weighted_f1":
+                # weighted average across domains
                 weights = domain_sizes / domain_sizes.sum()
                 tracked_dom_losses.append(float(np.sum(ep_loss * weights)))
                 tracked_dom_f1s.append(float(np.sum(ep_f1s * weights)))
             else:
+                # default to macro average across domains
                 tracked_dom_losses.append(float(np.mean(ep_loss[tracked_idxs])))
                 tracked_dom_f1s.append(float(np.mean(ep_f1s[tracked_idxs])))
 
@@ -951,6 +1076,16 @@ def train(trainset, validset, testset, run_tag, hp, domain_evals=None,
                 path=os.path.join(eval_plots_path, f"{safe_run_tag}_tracked_k_f1.png"),
                 best_epoch=best_epoch
             )
+
+    # if specified, mesure and report the training and inference run time statistics
+    if measure_runtimes and results:
+        results[0]["runtime_summary"] = {
+            "training_seconds": training_seconds,
+            "inference_seconds": selected_inference_seconds,
+            "inference_ms_per_pair": (
+                1000.0 * selected_inference_seconds / len(testset)
+            ),
+        }
 
     writer.close()
     return results if dom_iters else best_test_f1
